@@ -35,12 +35,19 @@ function USBSSH:init()
     self.autostart = G_reader_settings:isTrue("USBSSH_autostart")
     self.stop_usb_on_stop = G_reader_settings:nilOrTrue("USBSSH_stop_usb_on_stop")
     self.pause_on_suspend = G_reader_settings:nilOrTrue("USBSSH_pause_on_suspend")
+    self.start_only_on_usb = G_reader_settings:nilOrTrue("USBSSH_start_only_on_usb")
+    self.stop_on_unplug = G_reader_settings:nilOrTrue("USBSSH_stop_on_unplug")
     self.resume_after_suspend = false
+    self.autostart_pending = false
+    self.resume_after_unplug = false
+    self.usb_plugged = nil
     self.usb_gadget_owned = false
     self.usb_gadget_active = false
 
+    self:hookUsbHandlers()
+
     if self.autostart then
-        self:start()
+        self:start({ silent = true })
     end
 
     self.ui.menu:registerToMainMenu(self)
@@ -91,9 +98,58 @@ function USBSSH:stopUSBGadgetEthernet()
     return ok
 end
 
-function USBSSH:start()
+function USBSSH:isUsbPlugged()
+    if self.usb_plugged ~= nil then
+        return self.usb_plugged
+    end
+    if Device.getPowerDevice then
+        local powerd = Device:getPowerDevice()
+        if powerd and powerd.isCharging then
+            return powerd:isCharging()
+        end
+    end
+    return false
+end
+
+function USBSSH:hookUsbHandlers()
+    if self._usb_handlers_hooked or not UIManager.event_handlers then
+        return
+    end
+
+    local prev_in = UIManager.event_handlers.UsbPlugIn
+    UIManager.event_handlers.UsbPlugIn = function(...)
+        if prev_in then
+            prev_in(...)
+        end
+        self:onUsbPlugIn()
+    end
+
+    local prev_out = UIManager.event_handlers.UsbPlugOut
+    UIManager.event_handlers.UsbPlugOut = function(...)
+        if prev_out then
+            prev_out(...)
+        end
+        self:onUsbPlugOut()
+    end
+
+    self._usb_handlers_hooked = true
+end
+
+function USBSSH:start(opts)
+    opts = opts or {}
     if self:isRunning() then
         logger.dbg("[USBSSH] Not starting SSH server, already running.")
+        return
+    end
+
+    if self.start_only_on_usb and not self:isUsbPlugged() then
+        self.autostart_pending = true
+        if not opts.silent then
+            UIManager:show(InfoMessage:new{
+                timeout = 4,
+                text = _("USB not connected. USB SSH will start when plugged in."),
+            })
+        end
         return
     end
 
@@ -201,6 +257,8 @@ function USBSSH:stopPlugin(force)
 end
 
 function USBSSH:stop()
+    self.autostart_pending = false
+    self.resume_after_unplug = false
     local ok, err = self:stopPlugin(false)
     if not ok then
         logger.warn("USBSSH: graceful stop failed:", err)
@@ -233,6 +291,14 @@ function USBSSH:stopForSuspend()
     self:stopUSBGadgetEthernet()
 end
 
+function USBSSH:stopForUnplug()
+    local ok, err = self:stopPlugin(true)
+    if not ok then
+        logger.warn("USBSSH: failed to stop for unplug:", err)
+    end
+    self:stopUSBGadgetEthernet()
+end
+
 function USBSSH:onSuspend()
     if not self.pause_on_suspend then
         return
@@ -246,7 +312,37 @@ end
 function USBSSH:onResume()
     if self.resume_after_suspend then
         self.resume_after_suspend = false
-        self:start()
+        self:start({ silent = true })
+    end
+end
+
+function USBSSH:onUsbPlugIn()
+    self.usb_plugged = true
+    if self.autostart_pending or self.resume_after_unplug then
+        self.autostart_pending = false
+        self.resume_after_unplug = false
+        self:start({ silent = true })
+        return
+    end
+
+    if self:isRunning() and not self.usb_gadget_active then
+        local ok = self:startUSBGadgetEthernet()
+        if not ok then
+            logger.warn("USBSSH: failed to re-enable USB gadget after plug-in")
+        end
+    end
+end
+
+function USBSSH:onUsbPlugOut()
+    self.usb_plugged = false
+    if self.stop_on_unplug and self:isRunning() then
+        self.resume_after_unplug = true
+        self:stopForUnplug()
+        return
+    end
+
+    if self.usb_gadget_owned then
+        self:stopUSBGadgetEthernet()
     end
 end
 
@@ -367,6 +463,32 @@ function USBSSH:addToMainMenu(menu_items)
                         G_reader_settings:saveSetting("USBSSH_pause_on_suspend", true)
                     else
                         G_reader_settings:delSetting("USBSSH_pause_on_suspend")
+                    end
+                end,
+            },
+            {
+                text = _("Start only when USB is plugged in"),
+                checked_func = function() return self.start_only_on_usb end,
+                enabled_func = function() return not self:isRunning() end,
+                callback = function()
+                    self.start_only_on_usb = not self.start_only_on_usb
+                    if self.start_only_on_usb then
+                        G_reader_settings:saveSetting("USBSSH_start_only_on_usb", true)
+                    else
+                        G_reader_settings:delSetting("USBSSH_start_only_on_usb")
+                    end
+                end,
+            },
+            {
+                text = _("Stop USB SSH on unplug"),
+                checked_func = function() return self.stop_on_unplug end,
+                enabled_func = function() return not self:isRunning() end,
+                callback = function()
+                    self.stop_on_unplug = not self.stop_on_unplug
+                    if self.stop_on_unplug then
+                        G_reader_settings:saveSetting("USBSSH_stop_on_unplug", true)
+                    else
+                        G_reader_settings:delSetting("USBSSH_stop_on_unplug")
                     end
                 end,
             },
