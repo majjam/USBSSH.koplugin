@@ -34,6 +34,10 @@ function USBSSH:init()
     self.allow_no_password = G_reader_settings:isTrue("USBSSH_allow_no_password")
     self.autostart = G_reader_settings:isTrue("USBSSH_autostart")
     self.stop_usb_on_stop = G_reader_settings:nilOrTrue("USBSSH_stop_usb_on_stop")
+    self.pause_on_suspend = G_reader_settings:nilOrTrue("USBSSH_pause_on_suspend")
+    self.resume_after_suspend = false
+    self.usb_gadget_owned = false
+    self.usb_gadget_active = false
 
     if self.autostart then
         self:start()
@@ -47,6 +51,11 @@ function USBSSH:startUSBGadgetEthernet()
     if not Device:isKobo() then
         return true
     end
+    if util.pathExists("/sys/class/net/" .. usb_net_if) then
+        self.usb_gadget_owned = false
+        self.usb_gadget_active = true
+        return true
+    end
     if not util.pathExists(usb_gadget_path) then
         return false, _("USB gadget helper not found.")
     end
@@ -55,6 +64,8 @@ function USBSSH:startUSBGadgetEthernet()
     end
     for _ = 1, 20 do
         if util.pathExists("/sys/class/net/" .. usb_net_if) then
+            self.usb_gadget_owned = true
+            self.usb_gadget_active = true
             return true
         end
         ffiutil.sleep(0.1)
@@ -69,7 +80,15 @@ function USBSSH:stopUSBGadgetEthernet()
     if not util.pathExists(usb_gadget_path) then
         return true
     end
-    return os.execute(string.format("%q stop ethernet", usb_gadget_path)) == 0
+    if not self.usb_gadget_owned then
+        return true
+    end
+    local ok = os.execute(string.format("%q stop ethernet", usb_gadget_path)) == 0
+    if ok then
+        self.usb_gadget_owned = false
+        self.usb_gadget_active = false
+    end
+    return ok
 end
 
 function USBSSH:start()
@@ -206,6 +225,31 @@ function USBSSH:stop()
     })
 end
 
+function USBSSH:stopForSuspend()
+    local ok, err = self:stopPlugin(true)
+    if not ok then
+        logger.warn("USBSSH: failed to stop for suspend:", err)
+    end
+    self:stopUSBGadgetEthernet()
+end
+
+function USBSSH:onSuspend()
+    if not self.pause_on_suspend then
+        return
+    end
+    if self:isRunning() then
+        self.resume_after_suspend = true
+        self:stopForSuspend()
+    end
+end
+
+function USBSSH:onResume()
+    if self.resume_after_suspend then
+        self.resume_after_suspend = false
+        self:start()
+    end
+end
+
 function USBSSH:onToggleUSBSSHServer()
     if self:isRunning() then
         self:stop()
@@ -310,6 +354,19 @@ function USBSSH:addToMainMenu(menu_items)
                         G_reader_settings:saveSetting("USBSSH_stop_usb_on_stop", true)
                     else
                         G_reader_settings:delSetting("USBSSH_stop_usb_on_stop")
+                    end
+                end,
+            },
+            {
+                text = _("Pause USB SSH on suspend"),
+                checked_func = function() return self.pause_on_suspend end,
+                enabled_func = function() return not self:isRunning() end,
+                callback = function()
+                    self.pause_on_suspend = not self.pause_on_suspend
+                    if self.pause_on_suspend then
+                        G_reader_settings:saveSetting("USBSSH_pause_on_suspend", true)
+                    else
+                        G_reader_settings:delSetting("USBSSH_pause_on_suspend")
                     end
                 end,
             },
