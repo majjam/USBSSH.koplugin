@@ -27,6 +27,22 @@ end
 local USBSSH = WidgetContainer:extend{
     name = "USBSSH",
     is_doc_only = false,
+    -- settings (read in init, kept in sync with G_reader_settings)
+    SSH_port           = "2222",
+    allow_no_password  = false,
+    autostart          = false,
+    stop_usb_on_stop   = true,
+    pause_on_suspend   = true,
+    start_only_on_usb  = true,
+    stop_on_unplug     = true,
+    -- runtime state
+    resume_after_suspend  = false,  -- set in onSuspend, consumed in onResume
+    autostart_pending     = false,  -- deferred start waiting for USB plug-in
+    resume_after_unplug   = false,  -- set in onUsbPlugOut, consumed in onUsbPlugIn
+    usb_plugged           = nil,    -- nil = unknown, true/false = known
+    usb_gadget_owned      = false,  -- true if this plugin started the gadget
+    usb_gadget_active     = false,  -- true if rndis0 is believed up
+    _usb_handlers_hooked  = false,  -- guard for hookUsbHandlers
 }
 
 function USBSSH:init()
@@ -66,7 +82,8 @@ function USBSSH:startUSBGadgetEthernet()
     if not util.pathExists(usb_gadget_path) then
         return false, _("USB gadget helper not found.")
     end
-    if os.execute(string.format("%q start ethernet", usb_gadget_path)) ~= 0 then
+    -- NOTE: %s not %q — we need a plain shell word, not a Lua-quoted string
+    if os.execute(string.format("%s start ethernet", usb_gadget_path)) ~= 0 then
         return false, _("Failed to start USB ethernet gadget.")
     end
     for _ = 1, 20 do
@@ -90,7 +107,8 @@ function USBSSH:stopUSBGadgetEthernet()
     if not self.usb_gadget_owned then
         return true
     end
-    local ok = os.execute(string.format("%q stop ethernet", usb_gadget_path)) == 0
+    -- NOTE: %s not %q
+    local ok = os.execute(string.format("%s stop ethernet", usb_gadget_path)) == 0
     if ok then
         self.usb_gadget_owned = false
         self.usb_gadget_active = false
@@ -303,6 +321,8 @@ function USBSSH:onSuspend()
     if not self.pause_on_suspend then
         return
     end
+    -- Cancel any pending deferred start so it does not fire during/after sleep
+    self.autostart_pending = false
     if self:isRunning() then
         self.resume_after_suspend = true
         self:stopForSuspend()
@@ -312,7 +332,15 @@ end
 function USBSSH:onResume()
     if self.resume_after_suspend then
         self.resume_after_suspend = false
-        self:start({ silent = true })
+        -- Re-check USB state on resume: only restart if USB still / again plugged in
+        -- (isUsbPlugged falls back to isCharging which is accurate post-wake)
+        if not self.start_only_on_usb or self:isUsbPlugged() then
+            self:start({ silent = true })
+        else
+            -- Cable was removed during sleep; treat as pending
+            self.autostart_pending = true
+            logger.dbg("[USBSSH] resume: USB gone during sleep, deferring restart")
+        end
     end
 end
 
@@ -342,6 +370,16 @@ function USBSSH:onUsbPlugOut()
     end
 
     if self.usb_gadget_owned then
+        self:stopUSBGadgetEthernet()
+    end
+end
+
+function USBSSH:onCloseWidget()
+    -- Called when the plugin widget is removed from the hierarchy (KOReader exit or reload).
+    -- Stop the server cleanly so we do not leak a dropbear process.
+    if self:isRunning() then
+        logger.dbg("[USBSSH] onCloseWidget: stopping server")
+        self:stopPlugin(true)
         self:stopUSBGadgetEthernet()
     end
 end
@@ -498,7 +536,11 @@ function USBSSH:addToMainMenu(menu_items)
                 enabled_func = function() return not self:isRunning() end,
                 callback = function()
                     self.autostart = not self.autostart
-                    G_reader_settings:flipNilOrFalse("USBSSH_autostart")
+                    if self.autostart then
+                        G_reader_settings:saveSetting("USBSSH_autostart", true)
+                    else
+                        G_reader_settings:delSetting("USBSSH_autostart")
+                    end
                 end,
             },
         },
